@@ -149,6 +149,8 @@ class FederationHandler:
         self.http_client = hs.get_proxied_blacklisted_http_client()
         self._replication = hs.get_replication_data_handler()
         self._federation_event_handler = hs.get_federation_event_handler()
+        self._device_handler = hs.get_device_handler()
+        self._bulk_push_rule_evaluator = hs.get_bulk_push_rule_evaluator()
 
         self._clean_room_for_join_client = ReplicationCleanRoomRestServlet.make_client(
             hs
@@ -226,9 +228,7 @@ class FederationHandler:
         """
         backwards_extremities = [
             _BackfillPoint(event_id, depth, _BackfillPointType.BACKWARDS_EXTREMITY)
-            for event_id, depth in await self.store.get_oldest_event_ids_with_depth_in_room(
-                room_id
-            )
+            for event_id, depth in await self.store.get_backfill_points_in_room(room_id)
         ]
 
         insertion_events_to_be_backfilled: List[_BackfillPoint] = []
@@ -583,7 +583,11 @@ class FederationHandler:
                 # Mark the room as having partial state.
                 # The background process is responsible for unmarking this flag,
                 # even if the join fails.
-                await self.store.store_partial_state_room(room_id, ret.servers_in_room)
+                await self.store.store_partial_state_room(
+                    room_id=room_id,
+                    servers=ret.servers_in_room,
+                    device_lists_stream_id=self.store.get_device_stream_token(),
+                )
 
             try:
                 max_stream_id = (
@@ -608,6 +612,14 @@ class FederationHandler:
                     room_id,
                 )
                 raise LimitExceededError(msg=e.msg, errcode=e.errcode, retry_after_ms=0)
+            else:
+                # Record the join event id for future use (when we finish the full
+                # join). We have to do this after persisting the event to keep foreign
+                # key constraints intact.
+                if ret.partial_state:
+                    await self.store.write_partial_state_rooms_join_event_id(
+                        room_id, event.event_id
+                    )
             finally:
                 # Always kick off the background process that asynchronously fetches
                 # state for the room.
@@ -804,7 +816,7 @@ class FederationHandler:
             )
 
         # now check that we are *still* in the room
-        is_in_room = await self._event_auth_handler.check_host_in_room(
+        is_in_room = await self._event_auth_handler.is_host_in_room(
             room_id, self.server_name
         )
         if not is_in_room:
@@ -946,9 +958,15 @@ class FederationHandler:
         )
 
         context = EventContext.for_outlier(self._storage_controllers)
-        await self._federation_event_handler.persist_events_and_notify(
-            event.room_id, [(event, context)]
-        )
+
+        await self._bulk_push_rule_evaluator.action_for_event_by_user(event, context)
+        try:
+            await self._federation_event_handler.persist_events_and_notify(
+                event.room_id, [(event, context)]
+            )
+        except Exception:
+            await self.store.remove_push_actions_from_staging(event.event_id)
+            raise
 
         return event
 
@@ -1150,9 +1168,7 @@ class FederationHandler:
     async def on_backfill_request(
         self, origin: str, room_id: str, pdu_list: List[str], limit: int
     ) -> List[EventBase]:
-        in_room = await self._event_auth_handler.check_host_in_room(room_id, origin)
-        if not in_room:
-            raise AuthError(403, "Host not in room.")
+        await self._event_auth_handler.assert_host_in_room(room_id, origin)
 
         # Synapse asks for 100 events per backfill request. Do not allow more.
         limit = min(limit, 100)
@@ -1198,20 +1214,16 @@ class FederationHandler:
             event_id, allow_none=True, allow_rejected=True
         )
 
-        if event:
-            in_room = await self._event_auth_handler.check_host_in_room(
-                event.room_id, origin
-            )
-            if not in_room:
-                raise AuthError(403, "Host not in room.")
-
-            events = await filter_events_for_server(
-                self._storage_controllers, origin, [event]
-            )
-            event = events[0]
-            return event
-        else:
+        if not event:
             return None
+
+        await self._event_auth_handler.assert_host_in_room(event.room_id, origin)
+
+        events = await filter_events_for_server(
+            self._storage_controllers, origin, [event]
+        )
+        event = events[0]
+        return event
 
     async def on_get_missing_events(
         self,
@@ -1221,9 +1233,7 @@ class FederationHandler:
         latest_events: List[str],
         limit: int,
     ) -> List[EventBase]:
-        in_room = await self._event_auth_handler.check_host_in_room(room_id, origin)
-        if not in_room:
-            raise AuthError(403, "Host not in room.")
+        await self._event_auth_handler.assert_host_in_room(room_id, origin)
 
         # Only allow up to 20 events to be retrieved per request.
         limit = min(limit, 20)
@@ -1257,7 +1267,7 @@ class FederationHandler:
             "state_key": target_user_id,
         }
 
-        if await self._event_auth_handler.check_host_in_room(room_id, self.hs.hostname):
+        if await self._event_auth_handler.is_host_in_room(room_id, self.hs.hostname):
             room_version_obj = await self.store.get_room_version(room_id)
             builder = self.event_builder_factory.for_room_version(
                 room_version_obj, event_dict
@@ -1621,6 +1631,9 @@ class FederationHandler:
                 # TODO(faster_joins): notify workers in notify_room_un_partial_stated
                 #   https://github.com/matrix-org/synapse/issues/12994
                 await self.state_handler.update_current_state(room_id)
+
+                logger.info("Handling any pending device list updates")
+                await self._device_handler.handle_room_un_partial_stated(room_id)
 
                 logger.info("Clearing partial-state flag for %s", room_id)
                 success = await self.store.clear_partial_state_room(room_id)

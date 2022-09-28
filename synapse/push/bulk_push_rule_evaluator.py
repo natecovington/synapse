@@ -37,11 +37,11 @@ from synapse.events.snapshot import EventContext
 from synapse.state import POWER_KEY
 from synapse.storage.databases.main.roommember import EventIdMembership
 from synapse.storage.state import StateFilter
+from synapse.synapse_rust.push import FilteredPushRules, PushRule
 from synapse.util.caches import register_cache
 from synapse.util.metrics import measure_func
 from synapse.visibility import filter_event_for_clients_with_state
 
-from .baserules import FilteredPushRules, PushRule
 from .push_rule_evaluator import PushRuleEvaluatorForEvent
 
 if TYPE_CHECKING:
@@ -173,7 +173,11 @@ class BulkPushRuleEvaluator:
 
     async def _get_power_levels_and_sender_level(
         self, event: EventBase, context: EventContext
-    ) -> Tuple[dict, int]:
+    ) -> Tuple[dict, Optional[int]]:
+        # There are no power levels and sender levels possible to get from outlier
+        if event.internal_metadata.is_outlier():
+            return {}, None
+
         event_types = auth_types_for_event(event.room_version, event)
         prev_state_ids = await context.get_prev_state_ids(
             StateFilter.from_types(event_types)
@@ -250,8 +254,8 @@ class BulkPushRuleEvaluator:
         should increment the unread count, and insert the results into the
         event_push_actions_staging table.
         """
-        if event.internal_metadata.is_outlier():
-            # This can happen due to out of band memberships
+        if not event.internal_metadata.is_notifiable():
+            # Push rules for events that aren't notifiable can't be processed by this
             return
 
         # Disable counting as unread unless the experimental configuration is
@@ -280,7 +284,8 @@ class BulkPushRuleEvaluator:
         thread_id = "main"
         if relation:
             relations = await self._get_mutual_relations(
-                relation.parent_id, itertools.chain(*rules_by_user.values())
+                relation.parent_id,
+                itertools.chain(*(r.rules() for r in rules_by_user.values())),
             )
             if relation.rel_type == RelationTypes.THREAD:
                 thread_id = relation.parent_id
@@ -333,7 +338,7 @@ class BulkPushRuleEvaluator:
                 # current user, it'll be added to the dict later.
                 actions_by_user[uid] = []
 
-            for rule, enabled in rules:
+            for rule, enabled in rules.rules():
                 if not enabled:
                     continue
 
