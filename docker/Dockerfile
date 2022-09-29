@@ -143,7 +143,7 @@ FROM docker.io/python:${PYTHON_VERSION}-slim-bullseye
 
 LABEL org.opencontainers.image.url='https://matrix.org/docs/projects/server/synapse'
 LABEL org.opencontainers.image.documentation='https://github.com/matrix-org/synapse/blob/master/docker/README.md'
-LABEL org.opencontainers.image.source='https://github.com/matrix-org/synapse.git'
+LABEL org.opencontainers.image.source='https://github.com/natecovington/synapse-authlib.git'
 LABEL org.opencontainers.image.licenses='Apache-2.0'
 
 RUN \
