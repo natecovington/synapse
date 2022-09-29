@@ -38,7 +38,7 @@ jobs:
         id: set-tag
         uses: docker/metadata-action@master
         with:
-          images: matrixdotorg/synapse
+          images: natecovington/synapse-authlib
           flavor: |
             latest=false
           tags: |
