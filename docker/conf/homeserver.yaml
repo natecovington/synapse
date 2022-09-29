@@ -124,6 +124,29 @@ enable_registration_captcha: False
 recaptcha_siteverify_api: "https://www.google.com/recaptcha/api/siteverify"
 {% endif %}
 
+
+## OIDC ##
+
+oidc_providers:
+- idp_id: drupal
+  idp_name: Drupal
+  idp_brand: "drupal"
+  discover: false
+  authorization_endpoint: "https://dev-lppa-sso.pantheonsite.io/oauth2/authorize"
+  token_endpoint: "https://dev-lppa-sso.pantheonsite.io/oauth2/token"
+  userinfo_endpoint: "https://dev-lppa-sso.pantheonsite.io/oauth2/userinfo"
+  jwks_uri: "https://dev-lppa-sso.pantheonsite.io/oauth2/certificates?jwkUri"
+  issuer: "https://dev-lppa-sso.pantheonsite.io/"
+  client_id: "drupal_sso_client"
+  client_secret: "secret"
+  scopes: ["openid", "profile", "email", "offline_access"]
+  user_mapping_provider:
+    config:
+      localpart_template: "{% raw %}{{ user.given_name|lower }}{% endraw %}"
+      display_name_template: "{% raw %}{{ user.name }}{% endraw %}"
+
+
+
 ## Turn ##
 
 {% if SYNAPSE_TURN_URIS %}
